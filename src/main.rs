@@ -1,3 +1,5 @@
+use serde_json::Map;
+
 fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
     // If encoded_value starts with a digit, it's a number
     match encoded_value.chars().next().unwrap() {
@@ -13,6 +15,10 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
         'l' => {
             let (list, rem) = bendecode_l(encoded_value);
             (serde_json::Value::Array(list), rem)
+        }
+        'd' => {
+            let (dict, rem) = bendecode_d(encoded_value);
+            (serde_json::Value::Object(dict), rem)
         }
         _ => panic!("Unhandled encoded value: {}", encoded_value),
     }
@@ -47,6 +53,19 @@ fn bendecode_l(encoded_value: &str) -> (Vec<serde_json::Value>, &str) {
         rem = returned;
     }
     (list, rem.strip_prefix('e').unwrap())
+}
+
+fn bendecode_d(encoded_value: &str) -> (Map<String, serde_json::Value>, &str) {
+    // We know that they must be strings.
+    let mut dict = Map::new();
+    let mut rem = encoded_value.split_at(1).1;
+    while !rem.is_empty() && !rem.starts_with('e') {
+        let (key, returned) = bendecode_s(rem);
+        let (val, returned) = decode_bencoded_value(returned);
+        dict.insert(key, val);
+        rem = returned;
+    }
+    (dict, rem.strip_prefix('e').unwrap())
 }
 
 fn main() {
