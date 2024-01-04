@@ -88,59 +88,77 @@ impl std::fmt::Display for BenError {
     }
 }
 
-fn bendecode_s(encoded_value: &str) -> (String, &str) {
-    let colon_index = encoded_value.find(':').unwrap();
-    let number_string = &encoded_value[..colon_index];
-    let number = number_string.parse::<u32>().unwrap();
-    let string = &encoded_value[colon_index + 1..colon_index + 1 + number as usize];
-    (
-        string.to_string(),
-        &encoded_value[colon_index + 1 + number as usize..],
-    )
+fn decode_bencoded_value(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
+    match encoded_value[0] as char {
+        x if x.is_ascii_digit() => bendecode_s(encoded_value),
+        'i' => bendecode_i(&encoded_value[1..]),
+        'l' => bendecode_l(&encoded_value[1..]),
+        'd' => bendecode_d(&encoded_value[1..]),
+        x => Err(Box::new(BenError::UnexpectedToken { token: x as u8 })),
+    }
 }
 
-fn bendecode_i(encoded_value: &str) -> (i64, &str) {
-    // NOTE: Skip 'i'
-    let ending_index = encoded_value.find('e').unwrap();
-    let i_string = &encoded_value[1..ending_index];
+fn bendecode_s(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
+    // Iterate through and find the character that matches ':'
+    let colon_index = encoded_value
+        .iter()
+        .position(|&x| x == b':')
+        .ok_or(BenError::MissingToken { token: b':' })?;
+    let length_string = std::str::from_utf8(&encoded_value[..colon_index])?;
+    let length = length_string.parse::<usize>()?;
+    let string = std::str::from_utf8(&encoded_value[colon_index + 1..colon_index + 1 + length])?;
+    Ok((
+        Bencode::String(string.to_string()),
+        &encoded_value[colon_index + 1 + length..],
+    ))
+}
+
+fn bendecode_i(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
+    let ending_index = encoded_value
+        .iter()
+        .position(|&x| x == b'e')
+        .ok_or(BenError::MissingToken { token: b'e' })?;
+    let i_string = std::str::from_utf8(&encoded_value[1..ending_index])?;
     let number = i_string.parse::<i64>().unwrap();
-    (number, &encoded_value[ending_index + 1..])
+    Ok((Bencode::Number(number), &encoded_value[ending_index + 1..]))
 }
 
-fn bendecode_l(encoded_value: &str) -> (Vec<serde_json::Value>, &str) {
+fn bendecode_l(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
     let mut list = Vec::new();
-
-    let mut rem = encoded_value.split_at(1).1;
-    while !rem.is_empty() && !rem.starts_with('e') {
-        let (val, returned) = decode_bencoded_value(rem);
+    let mut rem = encoded_value;
+    while !rem.is_empty() && rem[0] != b'e' {
+        let (val, returned) = decode_bencoded_value(encoded_value)?;
         list.push(val);
         rem = returned;
     }
-    (list, rem.strip_prefix('e').unwrap())
+    Ok((Bencode::List(list), &rem[1..]))
 }
 
-fn bendecode_d(encoded_value: &str) -> (Map<String, serde_json::Value>, &str) {
-    // We know that they must be strings.
-    let mut dict = Map::new();
-    let mut rem = encoded_value.split_at(1).1;
-    while !rem.is_empty() && !rem.starts_with('e') {
-        let (key, returned) = bendecode_s(rem);
-        let (val, returned) = decode_bencoded_value(returned);
-        dict.insert(key, val);
-        rem = returned;
+fn bendecode_d(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
+    // We know that they must be strings
+    let mut dict = HashMap::new();
+    let mut rem = encoded_value;
+    while !rem.is_empty() && rem[0] != b'e' {
+        let (key, returned) = bendecode_s(rem)?;
+        // NOTE: This is impossible to fail if the above did not return
+        if let Bencode::String(s) = key {
+            let (val, returned) = decode_bencoded_value(returned)?;
+            dict.insert(s, val);
+            rem = returned;
+        }
     }
-    (dict, rem.strip_prefix('e').unwrap())
+    Ok((Bencode::Dict(dict), &rem[1..]))
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let command = &args[1];
-
-    if command == "decode" {
-        let encoded_value = &args[2];
-        let (decoded_value, _) = decode_bencoded_value(encoded_value);
-        println!("{}", decoded_value);
-    } else {
-        eprintln!("unknown command: {}", args[1])
+    let cli = arg_parse::Cli::parse();
+    match &cli.action {
+        arg_parse::Action::Decode { bencode } => {
+            println!("Decoding {}, bytes {:?}", bencode, bencode.as_bytes());
+            let (values, _) =
+                decode_bencoded_value(bencode.as_bytes()).expect("Some errors are found");
+            println!("Decoded Bencode = {:?}", values);
+        }
+        arg_parse::Action::Info { file } => todo!(),
     }
 }
