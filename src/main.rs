@@ -1,6 +1,6 @@
 mod arg_parse;
 
-use std::{collections::HashMap, error::Error};
+use std::{collections::HashMap, error::Error, io::Read};
 
 use clap::Parser;
 
@@ -59,7 +59,14 @@ enum Bencode {
     String(String),
     Number(i64),
     List(Vec<Bencode>),
-    Dict(HashMap<String, Bencode>),
+    Dict(HashMap<String, BencodeDictValues>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BencodeDictValues {
+    Bencode(Bencode),
+    // Special case of Bencode, some number of raw bytes.
+    Bytes(Vec<Vec<u8>>),
 }
 
 #[derive(Debug)]
@@ -88,12 +95,15 @@ impl std::fmt::Display for BenError {
     }
 }
 
-fn decode_bencoded_value(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
+fn decode_bencoded_value(
+    encoded_value: &[u8],
+    byte_mode_key: fn(&str) -> Option<usize>,
+) -> BenResult<(Bencode, &[u8])> {
     match encoded_value[0] as char {
         x if x.is_ascii_digit() => bendecode_s(encoded_value),
         'i' => bendecode_i(&encoded_value[1..]),
-        'l' => bendecode_l(&encoded_value[1..]),
-        'd' => bendecode_d(&encoded_value[1..]),
+        'l' => bendecode_l(&encoded_value[1..], byte_mode_key),
+        'd' => bendecode_d(&encoded_value[1..], byte_mode_key),
         x => Err(Box::new(BenError::UnexpectedToken { token: x as u8 })),
     }
 }
@@ -118,23 +128,52 @@ fn bendecode_i(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
         .iter()
         .position(|&x| x == b'e')
         .ok_or(BenError::MissingToken { token: b'e' })?;
-    let i_string = std::str::from_utf8(&encoded_value[1..ending_index])?;
+    let i_string = std::str::from_utf8(&encoded_value[..ending_index])?;
     let number = i_string.parse::<i64>().unwrap();
     Ok((Bencode::Number(number), &encoded_value[ending_index + 1..]))
 }
 
-fn bendecode_l(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
+fn bendecode_l(
+    encoded_value: &[u8],
+    byte_mode_key: fn(&str) -> Option<usize>,
+) -> BenResult<(Bencode, &[u8])> {
     let mut list = Vec::new();
     let mut rem = encoded_value;
     while !rem.is_empty() && rem[0] != b'e' {
-        let (val, returned) = decode_bencoded_value(encoded_value)?;
+        let (val, returned) = decode_bencoded_value(rem, byte_mode_key)?;
         list.push(val);
         rem = returned;
     }
     Ok((Bencode::List(list), &rem[1..]))
 }
 
-fn bendecode_d(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
+fn bendecode_bytez(encoded_value: &[u8], chunk_size: usize) -> BenResult<(Vec<Vec<u8>>, &[u8])> {
+    // Iterate through and find the character that matches ':'
+    let colon_index = encoded_value
+        .iter()
+        .position(|&x| x == b':')
+        .ok_or(BenError::MissingToken { token: b':' })?;
+    let length_string = std::str::from_utf8(&encoded_value[..colon_index])?;
+    let length = length_string.parse::<usize>()?;
+    // Length should be a multiple of chunk_size!
+    if length % chunk_size != 0 {
+        return Err(Box::new(BenError::UnexpectedTruncationError));
+    }
+
+    let bytes = &encoded_value[colon_index + 1..colon_index + 1 + length];
+    Ok((
+        bytes
+            .windows(chunk_size)
+            .map(|x| x.to_vec())
+            .collect::<Vec<Vec<u8>>>(),
+        &encoded_value[colon_index + 1 + length..],
+    ))
+}
+
+fn bendecode_d(
+    encoded_value: &[u8],
+    byte_mode_key: fn(&str) -> Option<usize>,
+) -> BenResult<(Bencode, &[u8])> {
     // We know that they must be strings
     let mut dict = HashMap::new();
     let mut rem = encoded_value;
@@ -142,23 +181,49 @@ fn bendecode_d(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
         let (key, returned) = bendecode_s(rem)?;
         // NOTE: This is impossible to fail if the above did not return
         if let Bencode::String(s) = key {
-            let (val, returned) = decode_bencoded_value(returned)?;
-            dict.insert(s, val);
-            rem = returned;
+            match byte_mode_key(&s) {
+                None => {
+                    let (val, returned) = decode_bencoded_value(returned, byte_mode_key)?;
+                    dict.insert(s, BencodeDictValues::Bencode(val));
+                    rem = returned;
+                }
+                Some(chunk_size) => {
+                    let (val, returned) = bendecode_bytez(returned, chunk_size)?;
+                    dict.insert(s, BencodeDictValues::Bytes(val));
+                    rem = returned;
+                }
+            }
         }
     }
     Ok((Bencode::Dict(dict), &rem[1..]))
 }
 
-fn main() {
+fn main() -> BenResult<()> {
     let cli = arg_parse::Cli::parse();
     match &cli.action {
         arg_parse::Action::Decode { bencode } => {
             println!("Decoding {}, bytes {:?}", bencode, bencode.as_bytes());
-            let (values, _) =
-                decode_bencoded_value(bencode.as_bytes()).expect("Some errors are found");
+            let (values, _) = decode_bencoded_value(bencode.as_bytes(), |s| match s {
+                "pieces" => Some(20),
+                _ => None,
+            })?;
             println!("Decoded Bencode = {:?}", values);
+            Ok(())
         }
-        arg_parse::Action::Info { file } => todo!(),
+        arg_parse::Action::Info { file } => {
+            println!("Decoding File {}", file.display());
+            // TODO: Buffered reads?
+            let mut f = std::fs::File::open(file)?;
+            let mut buffer = Vec::new();
+
+            // read the whole file
+            f.read_to_end(&mut buffer)?;
+            let (values, _) = decode_bencoded_value(&buffer, |s| match s {
+                "pieces" => Some(20),
+                _ => None,
+            })?;
+            println!("Decoded Bencode = {:?}", values);
+            Ok(())
+        }
     }
 }
