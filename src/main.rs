@@ -1,6 +1,7 @@
 mod arg_parse;
 
-use std::{collections::HashMap, error::Error, io::Read};
+use indexmap::IndexMap;
+use std::{error::Error, io::Read};
 
 use clap::Parser;
 
@@ -59,7 +60,7 @@ enum Bencode {
     String(String),
     Number(i64),
     List(Vec<Bencode>),
-    Dict(HashMap<String, BencodeDictValues>),
+    Dict(IndexMap<String, BencodeDictValues>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -175,7 +176,7 @@ fn bendecode_d(
     byte_mode_key: fn(&str) -> Option<usize>,
 ) -> BenResult<(Bencode, &[u8])> {
     // We know that they must be strings
-    let mut dict = HashMap::new();
+    let mut dict = IndexMap::new();
     let mut rem = encoded_value;
     while !rem.is_empty() && rem[0] != b'e' {
         let (key, returned) = bendecode_s(rem)?;
