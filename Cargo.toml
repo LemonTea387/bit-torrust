@@ -7,7 +7,9 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.4.12", features = ["derive"]}
-indexmap = "2.1.0"
 reqwest = "0.11.23"
 serde_json = "1.0.109"
-sha1 = "0.10.6"
+sha1_smol = "1.0.0"
+
+[dependencies.bencode]
+path = "crates/bencode"
