@@ -163,7 +163,7 @@ fn bendecode_bytez(encoded_value: &[u8], chunk_size: usize) -> BenResult<(Vec<Ve
     let bytes = &encoded_value[colon_index + 1..colon_index + 1 + length];
     Ok((
         bytes
-            .windows(chunk_size)
+            .chunks(chunk_size)
             .map(|x| x.to_vec())
             .collect::<Vec<Vec<u8>>>(),
         &encoded_value[colon_index + 1 + length..],
