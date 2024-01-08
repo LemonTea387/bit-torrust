@@ -1,6 +1,6 @@
 mod arg_parse;
 
-use indexmap::IndexMap;
+use bencode::{Bencode, BencodeDictValues};
 use std::{error::Error, io::Read};
 
 use clap::Parser;
@@ -32,12 +32,13 @@ use clap::Parser;
 // path - A list of UTF-8 encoded strings corresponding to subdirectory names, the last of which is the actual file name (a zero length list is an error case).
 
 // In the single file case, the name key is the name of a file, in the muliple file case, it's the name of a directory.
-type BenResult<T> = Result<T, Box<dyn Error>>;
+#[derive(Debug)]
 struct Torrent {
-    announce: reqwest::Url,
+    announce: Option<reqwest::Url>,
     info: Info,
 }
 
+#[derive(Debug)]
 struct Info {
     file_type: FileType,
     name: String,
@@ -45,166 +46,216 @@ struct Info {
     pieces: Vec<[u8; 20]>,
 }
 
+#[derive(Debug)]
 enum FileType {
     MultiFile { files: Vec<File> },
     SingleFile { length: usize },
 }
 
+#[derive(Debug)]
 struct File {
     length: usize,
     path: Vec<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Bencode {
-    String(String),
-    Number(i64),
-    List(Vec<Bencode>),
-    Dict(IndexMap<String, BencodeDictValues>),
+impl TryFrom<Bencode> for Torrent {
+    type Error = TorrentError;
+
+    fn try_from(value: Bencode) -> Result<Self, Self::Error> {
+        match value {
+            Bencode::Dict(torrent_table) => {
+                let announce = torrent_table.get("announce").and_then(|val| match val {
+                    BencodeDictValues::Bencode(Bencode::String(s)) => Some(s),
+                    _ => None,
+                });
+                let announce = match announce {
+                    Some(s) => {
+                        Some(reqwest::Url::parse(s).map_err(|_| TorrentError::InvalidAnnounceUrl)?)
+                    }
+                    None => None,
+                };
+
+                let info = match torrent_table.get("info") {
+                    Some(BencodeDictValues::Bencode(info_table)) => Info::parse_info(info_table),
+                    _ => Err(TorrentError::InvalidTorrentFile(
+                        "Info dictionary does not exist.".to_string(),
+                    )),
+                }?;
+
+                Ok(Self { announce, info })
+            }
+            _ => Err(TorrentError::InvalidTorrentFile(
+                "Torrent metainfo file should have a bencoded dictionary.".to_string(),
+            )),
+        }
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum BencodeDictValues {
-    Bencode(Bencode),
-    // Special case of Bencode, some number of raw bytes.
-    Bytes(Vec<Vec<u8>>),
+impl Info {
+    fn parse_info(value: &Bencode) -> Result<Self, TorrentError> {
+        let info_table = match value {
+            Bencode::Dict(val) => val,
+            _ => {
+                return Err(TorrentError::InvalidTorrentFile(
+                    "Files list is not a valid bencoded dictionary.".to_string(),
+                ))
+            }
+        };
+        let file_type = Self::resolve_file_type(value)?;
+        let name = info_table
+            .get("name")
+            .and_then(|val| match val {
+                BencodeDictValues::Bencode(Bencode::String(s)) => Some(s.to_string()),
+                _ => None,
+            })
+            .ok_or(TorrentError::InvalidTorrentFile(
+                "Should have advisory name".to_string(),
+            ))?;
+
+        let piece_length = info_table
+            .get("piece length")
+            .and_then(|val| match val {
+                BencodeDictValues::Bencode(Bencode::Number(i)) => Some(*i as usize),
+                _ => None,
+            })
+            .ok_or(TorrentError::InvalidTorrentFile(
+                "Should have piece length information.".to_string(),
+            ))?;
+
+        let pieces = match info_table.get("pieces") {
+            Some(BencodeDictValues::Bytes(bytez)) => {
+                let mut result: Vec<[u8; 20]> = Vec::new();
+                bytez.into_iter().try_for_each(|vec_of_bytes| {
+                    if vec_of_bytes.len() != 20 {
+                        return Err(TorrentError::InvalidTorrentFile(
+                            "Invalid file hash.".to_string(),
+                        ));
+                    }
+                    // This unwrap and the indexing is safe as it is hopefully handled at the top.
+                    result.push(<[u8; 20]>::try_from(&vec_of_bytes[..20]).unwrap());
+                    Ok(())
+                })?;
+                Ok(result)
+            }
+            _ => Err(TorrentError::InvalidTorrentFile(
+                "No pieces found".to_string(),
+            )),
+        }?;
+
+        Ok(Self {
+            file_type,
+            name,
+            piece_length,
+            pieces,
+        })
+    }
+    fn resolve_file_type(value: &Bencode) -> Result<FileType, TorrentError> {
+        let info_table = match value {
+            Bencode::Dict(val) => val,
+            _ => {
+                return Err(TorrentError::InvalidTorrentFile(
+                    "Files list is not a valid bencoded dictionary.".to_string(),
+                ))
+            }
+        };
+        let file_type;
+        // Check file mode
+        if let Some(BencodeDictValues::Bencode(Bencode::Number(x))) = info_table.get("length") {
+            file_type = FileType::SingleFile {
+                length: *x as usize,
+            };
+        } else if let Some(BencodeDictValues::Bencode(Bencode::List(files_list))) =
+            info_table.get("files")
+        {
+            let files = files_list
+                .into_iter()
+                .map(|bencode| {
+                    // WARNING: PREPARE FOR SOME CODE ABOMINATION
+                    // File list contains dictionary representing a File
+                    match bencode {
+                        Bencode::Dict(file_table) => {
+                            let length = match file_table.get("length") {
+                                Some(BencodeDictValues::Bencode(Bencode::Number(x))) => *x as usize,
+                                _ => {
+                                    return Err(TorrentError::InvalidTorrentFile(
+                                        "File does not have valid file length.".to_string(),
+                                    ))
+                                }
+                            };
+                            let path = match file_table.get("path") {
+                                Some(BencodeDictValues::Bencode(Bencode::List(list_of_path))) => {
+                                    // We pray that list_of_path is actually list of strings.
+                                    list_of_path
+                                        .iter()
+                                        .map(|bencode| match bencode {
+                                            Bencode::String(s) => Ok(s.to_string()),
+                                            _ => Err(TorrentError::InvalidTorrentFile(
+                                                "Invalid file path".to_string(),
+                                            )),
+                                        })
+                                        .collect::<Result<Vec<String>, TorrentError>>()
+                                }
+                                _ => {
+                                    return Err(TorrentError::InvalidTorrentFile(
+                                        "File does not have a valid file path.".to_string(),
+                                    ))
+                                }
+                            }?;
+                            Ok(File { length, path })
+                        }
+                        _ => Err(TorrentError::InvalidTorrentFile(
+                            "Invalid files list.".to_string(),
+                        )),
+                    }
+                })
+                .collect::<Result<Vec<_>, TorrentError>>()?;
+            file_type = FileType::MultiFile { files }
+        } else {
+            return Err(TorrentError::InvalidTorrentFile(
+                "Could not determine file type".to_string(),
+            ));
+        }
+
+        Ok(file_type)
+    }
+}
+
+impl TryFrom<Bencode> for Info {
+    type Error = TorrentError;
+
+    fn try_from(value: Bencode) -> Result<Self, Self::Error> {
+        // Determine if it's a multifile or singlefile, a singlefile only has length
+        if let Bencode::Dict(info_table) = value {}
+        Err(TorrentError::InvalidTorrentFile(
+            "Info table should have a bencoded dictionary.".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug)]
-enum BenError {
-    MisplacedClosingError,
-    UnexpectedTruncationError,
-    UnexpectedToken { token: u8 },
-    MissingToken { token: u8 },
+enum TorrentError {
+    InvalidAnnounceUrl,
+    InvalidTorrentFile(String),
 }
+impl std::error::Error for TorrentError {}
 
-impl std::error::Error for BenError {}
-impl std::fmt::Display for BenError {
+impl std::fmt::Display for TorrentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BenError::MisplacedClosingError => {
-                write!(f, "Unexpected closing tag 'e' found.")
+            TorrentError::InvalidTorrentFile(s) => {
+                write!(f, "Not a valid torrent file, missing {}", s)
             }
-            BenError::UnexpectedTruncationError => write!(f, "Unexpected ending of byte stream."),
-            BenError::UnexpectedToken { token } => {
-                write!(f, "Unexpected token : {}.", token)
-            }
-            BenError::MissingToken { token } => {
-                write!(f, "Missing token in stream : {}.", token)
-            }
+            TorrentError::InvalidAnnounceUrl => todo!(),
         }
     }
 }
 
-fn decode_bencoded_value(
-    encoded_value: &[u8],
-    byte_mode_key: fn(&str) -> Option<usize>,
-) -> BenResult<(Bencode, &[u8])> {
-    match encoded_value[0] as char {
-        x if x.is_ascii_digit() => bendecode_s(encoded_value),
-        'i' => bendecode_i(&encoded_value[1..]),
-        'l' => bendecode_l(&encoded_value[1..], byte_mode_key),
-        'd' => bendecode_d(&encoded_value[1..], byte_mode_key),
-        x => Err(Box::new(BenError::UnexpectedToken { token: x as u8 })),
-    }
-}
-
-fn bendecode_s(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
-    // Iterate through and find the character that matches ':'
-    let colon_index = encoded_value
-        .iter()
-        .position(|&x| x == b':')
-        .ok_or(BenError::MissingToken { token: b':' })?;
-    let length_string = std::str::from_utf8(&encoded_value[..colon_index])?;
-    let length = length_string.parse::<usize>()?;
-    let string = std::str::from_utf8(&encoded_value[colon_index + 1..colon_index + 1 + length])?;
-    Ok((
-        Bencode::String(string.to_string()),
-        &encoded_value[colon_index + 1 + length..],
-    ))
-}
-
-fn bendecode_i(encoded_value: &[u8]) -> BenResult<(Bencode, &[u8])> {
-    let ending_index = encoded_value
-        .iter()
-        .position(|&x| x == b'e')
-        .ok_or(BenError::MissingToken { token: b'e' })?;
-    let i_string = std::str::from_utf8(&encoded_value[..ending_index])?;
-    let number = i_string.parse::<i64>().unwrap();
-    Ok((Bencode::Number(number), &encoded_value[ending_index + 1..]))
-}
-
-fn bendecode_l(
-    encoded_value: &[u8],
-    byte_mode_key: fn(&str) -> Option<usize>,
-) -> BenResult<(Bencode, &[u8])> {
-    let mut list = Vec::new();
-    let mut rem = encoded_value;
-    while !rem.is_empty() && rem[0] != b'e' {
-        let (val, returned) = decode_bencoded_value(rem, byte_mode_key)?;
-        list.push(val);
-        rem = returned;
-    }
-    Ok((Bencode::List(list), &rem[1..]))
-}
-
-fn bendecode_bytez(encoded_value: &[u8], chunk_size: usize) -> BenResult<(Vec<Vec<u8>>, &[u8])> {
-    // Iterate through and find the character that matches ':'
-    let colon_index = encoded_value
-        .iter()
-        .position(|&x| x == b':')
-        .ok_or(BenError::MissingToken { token: b':' })?;
-    let length_string = std::str::from_utf8(&encoded_value[..colon_index])?;
-    let length = length_string.parse::<usize>()?;
-    // Length should be a multiple of chunk_size!
-    if length % chunk_size != 0 {
-        return Err(Box::new(BenError::UnexpectedTruncationError));
-    }
-
-    let bytes = &encoded_value[colon_index + 1..colon_index + 1 + length];
-    Ok((
-        bytes
-            .chunks(chunk_size)
-            .map(|x| x.to_vec())
-            .collect::<Vec<Vec<u8>>>(),
-        &encoded_value[colon_index + 1 + length..],
-    ))
-}
-
-fn bendecode_d(
-    encoded_value: &[u8],
-    byte_mode_key: fn(&str) -> Option<usize>,
-) -> BenResult<(Bencode, &[u8])> {
-    // We know that they must be strings
-    let mut dict = IndexMap::new();
-    let mut rem = encoded_value;
-    while !rem.is_empty() && rem[0] != b'e' {
-        let (key, returned) = bendecode_s(rem)?;
-        // NOTE: This is impossible to fail if the above did not return
-        if let Bencode::String(s) = key {
-            match byte_mode_key(&s) {
-                None => {
-                    let (val, returned) = decode_bencoded_value(returned, byte_mode_key)?;
-                    dict.insert(s, BencodeDictValues::Bencode(val));
-                    rem = returned;
-                }
-                Some(chunk_size) => {
-                    let (val, returned) = bendecode_bytez(returned, chunk_size)?;
-                    dict.insert(s, BencodeDictValues::Bytes(val));
-                    rem = returned;
-                }
-            }
-        }
-    }
-    Ok((Bencode::Dict(dict), &rem[1..]))
-}
-
-fn main() -> BenResult<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let cli = arg_parse::Cli::parse();
     match &cli.action {
         arg_parse::Action::Decode { bencode } => {
             println!("Decoding {}, bytes {:?}", bencode, bencode.as_bytes());
-            let (values, _) = decode_bencoded_value(bencode.as_bytes(), |s| match s {
+            let (values, _) = Bencode::from_bytes(bencode.as_bytes(), |s| match s {
                 "pieces" => Some(20),
                 _ => None,
             })?;
@@ -219,11 +270,12 @@ fn main() -> BenResult<()> {
 
             // read the whole file
             f.read_to_end(&mut buffer)?;
-            let (values, _) = decode_bencoded_value(&buffer, |s| match s {
+            let (values, _) = Bencode::from_bytes(&buffer, |s| match s {
                 "pieces" => Some(20),
                 _ => None,
             })?;
             println!("Decoded Bencode = {:?}", values);
+            println!("Decoded Torrent file = {:?}", Torrent::try_from(values)?);
             Ok(())
         }
     }
