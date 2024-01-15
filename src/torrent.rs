@@ -24,34 +24,36 @@
 
 // path - A list of UTF-8 encoded strings corresponding to subdirectory names, the last of which is the actual file name (a zero length list is an error case).
 
+use std::{error::Error, io::Read, path::Path};
+
 use bencode::{Bencode, BencodeDictValues};
 use sha1_smol::{Digest, Sha1};
 
 // In the single file case, the name key is the name of a file, in the muliple file case, it's the name of a directory.
 #[derive(Debug)]
 pub struct Torrent {
-    pub announce: Option<reqwest::Url>,
+    pub announce: Option<String>,
     pub info: Info,
 }
 
 #[derive(Debug)]
 pub struct Info {
-    file_type: FileType,
-    name: String,
-    piece_length: usize,
-    pieces: Vec<[u8; 20]>,
+    pub file_type: FileType,
+    pub name: String,
+    pub piece_length: usize,
+    pub pieces: Vec<[u8; 20]>,
 }
 
 #[derive(Debug)]
-enum FileType {
+pub enum FileType {
     MultiFile { files: Vec<File> },
     SingleFile { length: usize },
 }
 
 #[derive(Debug)]
-struct File {
-    length: usize,
-    path: Vec<String>,
+pub struct File {
+    pub length: usize,
+    pub path: Vec<String>,
 }
 
 impl TryFrom<Bencode> for Torrent {
@@ -61,15 +63,9 @@ impl TryFrom<Bencode> for Torrent {
         match value {
             Bencode::Dict(torrent_table) => {
                 let announce = torrent_table.get("announce").and_then(|val| match val {
-                    BencodeDictValues::Bencode(Bencode::String(s)) => Some(s),
+                    BencodeDictValues::Bencode(Bencode::String(s)) => Some(s.clone()),
                     _ => None,
                 });
-                let announce = match announce {
-                    Some(s) => {
-                        Some(reqwest::Url::parse(s).map_err(|_| TorrentError::InvalidAnnounceUrl)?)
-                    }
-                    None => None,
-                };
 
                 let info = match torrent_table.get("info") {
                     Some(BencodeDictValues::Bencode(info_table)) => Info::parse_info(info_table),
@@ -84,6 +80,30 @@ impl TryFrom<Bencode> for Torrent {
                 "Torrent metainfo file should have a bencoded dictionary.".to_string(),
             )),
         }
+    }
+}
+
+impl Torrent {
+    pub fn from_file(file_path: &Path) -> Result<Self, Box<dyn Error>> {
+        // TODO: Buffered reads?
+        let mut f = std::fs::File::open(file_path)?;
+        let mut buffer = Vec::new();
+
+        // read the whole file
+        f.read_to_end(&mut buffer)?;
+        let (values, _) = Bencode::from_bytes(&buffer, |s| match s {
+            "pieces" => Some(20),
+            _ => None,
+        })?;
+        Ok(Torrent::try_from(values)?)
+    }
+
+    pub fn from_bytes(encoded_bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
+        let (values, _) = Bencode::from_bytes(encoded_bytes, |s| match s {
+            "pieces" => Some(20),
+            _ => None,
+        })?;
+        Ok(Torrent::try_from(values)?)
     }
 }
 
