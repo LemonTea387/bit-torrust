@@ -134,6 +134,19 @@ impl Info {
         sha1.update(&self.to_bytes());
         sha1.digest()
     }
+
+    pub fn get_url_encoded_hash(&self) -> String {
+        let hash = hex::encode(self.get_hash().bytes());
+        hash.chars()
+            .enumerate()
+            .fold(String::with_capacity(hash.len()), |mut acc, (i, chr)| {
+                if i % 2 == 0 {
+                    acc.push('%');
+                }
+                acc.push(chr);
+                acc
+            })
+    }
 }
 impl FileType {
     fn to_bytes(&self) -> Vec<u8> {
