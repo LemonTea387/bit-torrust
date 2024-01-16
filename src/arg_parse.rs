@@ -11,6 +11,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Action {
-    Decode { bencode: String },
-    Info { file: PathBuf },
+    Decode {
+        bencode: String,
+    },
+    Info {
+        file: PathBuf,
+        #[arg(long,short = 'p')]
+        peer_discovery: bool,
+    },
 }
