@@ -1,2 +1,3 @@
 pub mod torrent;
-pub mod torrent_client;
+pub mod tracker;
+pub mod peer;

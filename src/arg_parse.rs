@@ -16,7 +16,10 @@ pub enum Action {
     },
     Info {
         file: PathBuf,
-        #[arg(long,short = 'p')]
+        #[arg(long, short = 'p')]
         peer_discovery: bool,
+    },
+    Download {
+        file: PathBuf,
     },
 }
