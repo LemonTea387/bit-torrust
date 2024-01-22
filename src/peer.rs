@@ -93,19 +93,19 @@ enum PeerMessage {
     Have = 4,
     Bitfield(Vec<u8>) = 5,
     Request {
-        index: usize,
-        begin: usize,
-        length: usize,
+        index: u32,
+        begin: u32,
+        length: u32,
     } = 6,
     Piece {
-        index: usize,
-        begin: usize,
+        index: u32,
+        begin: u32,
         piece: Vec<u8>,
     } = 7,
     Cancel {
-        index: usize,
-        begin: usize,
-        length: usize,
+        index: u32,
+        begin: u32,
+        length: u32,
     } = 8,
 }
 
