@@ -6,6 +6,8 @@ use std::{
 
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 
+use crate::torrent::Info;
+
 pub(crate) const PEER_ID: &str = "1337cafebabedeadbeef";
 
 #[derive(Debug)]
@@ -28,14 +30,13 @@ impl TryFrom<&[u8]> for Peer {
 }
 
 impl Peer {
-    pub fn connect(&self, info_hash_slice: &[u8]) -> Result<PeerConnection, Box<dyn Error>> {
+    pub fn connect<'a>(
+        &'a self,
+        info_table: &'a Info,
+        info_hash: &'a [u8],
+    ) -> Result<PeerConnection, Box<dyn Error>> {
         let connection = TcpStream::connect((self.ip_addr, self.port))?;
-        let mut info_hash = [0u8; 20];
-        info_hash.clone_from_slice(info_hash_slice);
-        Ok(PeerConnection {
-            connection,
-            info_hash,
-        })
+        PeerConnection::new(connection, info_table, info_hash)
     }
 }
 
@@ -45,44 +46,101 @@ impl std::fmt::Display for Peer {
     }
 }
 
-pub struct PeerConnection {
+pub struct PeerConnection<'a> {
     connection: TcpStream,
-    info_hash: [u8; 20],
+    info_table: &'a Info,
+    peer_id: PeerId,
 }
 
-impl PeerConnection {
-    pub fn handshake(mut self) -> Result<PeerConnectionReady, Box<dyn Error>> {
+impl PeerConnection<'_> {
+    pub fn new<'a>(
+        mut connection: TcpStream,
+        info_table: &'a Info,
+        info_hash: &'a [u8],
+    ) -> Result<PeerConnection<'a>, Box<dyn Error>> {
+        let peer_id = Self::handshake(&mut connection, info_hash)?;
+        Ok(PeerConnection {
+            connection,
+            info_table,
+            peer_id,
+        })
+    }
+    fn handshake(connection: &mut TcpStream, info_hash: &[u8]) -> Result<PeerId, PeerError> {
         // Try handshake
         // <19 in byte>BitTorrent protocol<8Bytes0><20byte sha1 info table hash><20peerid>
         let mut buf = [0u8; 68];
         buf[0] = 19;
         buf[1..20].clone_from_slice(b"BitTorrent protocol");
-        buf[28..48].clone_from_slice(&self.info_hash);
+        buf[28..48].clone_from_slice(info_hash);
         buf[48..].clone_from_slice(PEER_ID.as_bytes());
 
-        match self.connection.write(&buf) {
+        match connection.write(&buf) {
             Ok(68) => {}
-            _ => return Err(Box::new(PeerError::PeerHandshakeFailed)),
+            _ => return Err(PeerError::PeerHandshakeFailed),
         }
 
         let mut response_buf = [0u8; 68];
-        self.connection.read_exact(&mut response_buf)?;
+        connection.read_exact(&mut response_buf)?;
 
         let mut peer_id = [0u8; 20];
         peer_id.clone_from_slice(&response_buf[48..]);
-
-        Ok(PeerConnectionReady {
-            connection: self.connection,
-            peer_id,
-        })
+        Ok(PeerId(
+            response_buf[48..]
+                .try_into()
+                .expect("Slice should already have the right length!"),
+        ))
+    }
+    fn receive_decode(&mut self) -> Result<Option<PeerMessage>, PeerError> {
+        // Length is a 4byte int:msgcode[payload]
+        let mut len_buf = [0u8; 4];
+        self.connection.read_exact(&mut len_buf)?;
+        let len = BigEndian::read_u32(&len_buf);
+        if len == 0 {
+            // Just keep-alive, go next
+            return Ok(None);
+        }
+        let msg_type = self.connection.read_u8()?;
+        // The actual msg len does not count the msg code
+        let actual_msg_len = len - 1;
+        match msg_type {
+            0 => Ok(Some(PeerMessage::Choke)),
+            1 => Ok(Some(PeerMessage::Unchoke)),
+            2 => Ok(Some(PeerMessage::Interested)),
+            3 => Ok(Some(PeerMessage::NotInterested)),
+            4 => Ok(Some(PeerMessage::Have)),
+            //TODO : Check length with the received stuff.
+            5 => {
+                let mut bitfield = vec![0u8; actual_msg_len as usize];
+                self.connection.read_exact(&mut bitfield)?;
+                Ok(Some(PeerMessage::Bitfield(bitfield)))
+            }
+            6 => Ok(Some(PeerMessage::Request {
+                index: self.connection.read_u32::<BigEndian>()?,
+                begin: self.connection.read_u32::<BigEndian>()?,
+                length: self.connection.read_u32::<BigEndian>()?,
+            })),
+            7 => {
+                let index = self.connection.read_u32::<BigEndian>()?;
+                let begin = self.connection.read_u32::<BigEndian>()?;
+                let mut piece_data = vec![0u8; (actual_msg_len - 8) as usize];
+                self.connection.read_exact(&mut piece_data)?;
+                Ok(Some(PeerMessage::Piece {
+                    index,
+                    begin,
+                    piece: piece_data,
+                }))
+            }
+            8 => Ok(Some(PeerMessage::Cancel {
+                index: self.connection.read_u32::<BigEndian>()?,
+                begin: self.connection.read_u32::<BigEndian>()?,
+                length: self.connection.read_u32::<BigEndian>()?,
+            })),
+            _ => Err(PeerError::TcpStreamGarbageReceived),
+        }
     }
 }
 
-pub struct PeerConnectionReady {
-    connection: TcpStream,
-    peer_id: [u8; 20],
-}
-
+struct PeerId([u8; 20]);
 
 #[repr(u8)]
 enum PeerMessage {
