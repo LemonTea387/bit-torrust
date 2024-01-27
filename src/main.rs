@@ -19,17 +19,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         } => {
             let torrent_metadata = Torrent::from_file(file)?;
             if *peer_discovery {
-                // Tracker GET
-                // Well if there are no announce, we'll just not handle it for now.
-                let info_table = &torrent_metadata.info;
-                let url_encoded_hash = info_table.get_url_encoded_hash();
-                let left = (info_table.piece_length * info_table.pieces.len()) as u64;
-                let mut tracker_service = TrackerService::new(
-                    &torrent_metadata.announce.unwrap(),
-                    6881,
-                    &url_encoded_hash,
-                );
-                let peers = tracker_service.get_peers(0, 0, left)?;
+                let mut tracker_service = TrackerService::new(6881, &torrent_metadata);
+                let peers = tracker_service.get_peers(
+                    0,
+                    0,
+                    torrent_metadata.info.get_file_length() as u64,
+                )?;
                 println!(
                     "Peers : \n{}",
                     peers
@@ -41,19 +36,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
-        arg_parse::Action::Download { file } => {
-            let torrent_metadata = Torrent::from_file(file)?;
+        arg_parse::Action::Download { file: torrent_file } => {
+            let torrent_metadata = Torrent::from_file(torrent_file)?;
             let info_table = &torrent_metadata.info;
-            let url_encoded_hash = info_table.get_url_encoded_hash();
-            let left = (info_table.piece_length * info_table.pieces.len()) as u64;
-            let mut tracker_service =
-                TrackerService::new(&torrent_metadata.announce.unwrap(), 6881, &url_encoded_hash);
-            let peers = tracker_service.get_peers(0, 0, left)?;
             let hash = info_table.get_hash().bytes();
-            // TODO: Maintain a pool of connections to peers, 5 as per recommended in spec of
-            // bittorrent economics paper
-            let connection = peers[0].connect(&hash)?;
-            let connection = connection.handshake()?;
+            let mut tracker_service = TrackerService::new(6881, &torrent_metadata);
+            let peers =
+                tracker_service.get_peers(0, 0, torrent_metadata.info.get_file_length() as u64)?;
+            // TODO: Maintain a pool of connections to peers
+            let connection = peers[0].connect(info_table, &hash)?;
 
             Ok(())
         }

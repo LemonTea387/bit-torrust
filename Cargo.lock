@@ -104,6 +104,7 @@ name = "bit-torrust"
 version = "0.1.0"
 dependencies = [
  "bencode",
+ "bit-vec",
  "byteorder",
  "clap",
  "hex",
@@ -112,6 +113,12 @@ dependencies = [
  "sha1_smol",
  "thiserror",
 ]
+
+[[package]]
+name = "bit-vec"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
 
 [[package]]
 name = "bitflags"
