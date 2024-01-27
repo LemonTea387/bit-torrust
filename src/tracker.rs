@@ -33,13 +33,14 @@ impl<'a> TrackerService<'a> {
         &mut self,
         uploaded: u64,
         downloaded: u64,
+        left:u64
     ) -> Result<Vec<Peer>, Box<dyn Error>> {
         let query_params = [
             ("peer_id", PEER_ID),
             ("port", &self.port.to_string()),
             ("uploaded", &uploaded.to_string()),
             ("downloaded", &downloaded.to_string()),
-            ("left", &self.torrent.info.get_file_length().to_string()),
+            ("left", &left.to_string()),
             ("compact", "1"),
         ];
 
