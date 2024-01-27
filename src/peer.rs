@@ -54,6 +54,7 @@ pub struct PeerConnection<'a> {
     info_table: &'a Info,
     peer_id: PeerId,
     bitfield: Option<Vec<u8>>,
+    choke: bool,
 }
 
 impl PeerConnection<'_> {
@@ -68,6 +69,7 @@ impl PeerConnection<'_> {
             info_table,
             peer_id,
             bitfield: None,
+            choke: true,
         })
     }
     fn handshake(connection: &mut TcpStream, info_hash: &[u8]) -> Result<PeerId, PeerError> {
@@ -207,39 +209,43 @@ impl PeerConnection<'_> {
     pub fn download_piece(&mut self, piece_index: u32) -> Result<PieceData, PeerError> {
         self.connection
             .write_all(&self.message_payload(PeerMessage::Interested))?;
+        while self.choke {
+            if let Some(PeerMessage::Unchoke) = self.receive_decode()? {
+                self.choke = false;
+            }
+        }
 
         let piece_len = self.info_table.piece_length;
         let file_size = self.info_table.get_file_length();
         // A rounded up division!
         let block_number =
             piece_len / PIECE_BLOCK_LEN + usize::from(file_size % PIECE_BLOCK_LEN == 0);
-        let mut requested: bool = false;
         let mut piece_received = BitVec::from_elem(block_number, false);
         let mut blocks = BinaryHeap::new();
+        
+        // Send Request
+        let last_piece = piece_index as usize == (self.info_table.pieces.len() - 1);
+        let irregular_blocks = file_size % PIECE_BLOCK_LEN != 0;
+        for i in 0..block_number {
+            let request_buf = self.message_payload(PeerMessage::Request {
+                index: piece_index,
+                begin: (i * PIECE_BLOCK_LEN) as u32,
+                // A truncated length is only present in last piece's last block.
+                length: if !last_piece && irregular_blocks && i == block_number - 1 {
+                    PIECE_BLOCK_LEN as u32
+                } else {
+                    (file_size % PIECE_BLOCK_LEN) as u32
+                },
+            });
+            self.connection.write_all(&request_buf)?;
+        }
+
+        // Receive loop
         loop {
             match self.receive_decode()? {
                 Some(PeerMessage::Bitfield(bitfield)) => self.bitfield = Some(bitfield),
                 Some(PeerMessage::Unchoke) => {
-                    // When receiving unchoke notif, send the request.
-                    if !requested {
-                        let last_piece = piece_index as usize == (self.info_table.pieces.len() - 1);
-                        let irregular_blocks = file_size % PIECE_BLOCK_LEN != 0;
-                        for i in 0..block_number {
-                            let request_buf = self.message_payload(PeerMessage::Request {
-                                index: piece_index,
-                                begin: (i * PIECE_BLOCK_LEN) as u32,
-                                // A truncated length is only present in last piece's last block.
-                                length: if !last_piece && irregular_blocks && i == block_number - 1
-                                {
-                                    PIECE_BLOCK_LEN as u32
-                                } else {
-                                    (file_size % PIECE_BLOCK_LEN) as u32
-                                },
-                            });
-                            self.connection.write_all(&request_buf)?;
-                        }
-                        requested = true;
-                    }
+                    self.choke = false;
                 }
                 Some(PeerMessage::Piece {
                     index,
@@ -256,6 +262,10 @@ impl PeerConnection<'_> {
                     if piece_received.all() {
                         break;
                     }
+                }
+                Some(PeerMessage::Choke) => {
+                    self.choke = true;
+                    break;
                 }
                 _ => {}
             };
