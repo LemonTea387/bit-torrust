@@ -147,6 +147,13 @@ impl Info {
                 acc
             })
     }
+
+    pub fn get_file_length(&self) -> usize {
+        match &self.file_type {
+            FileType::MultiFile { files } => files.iter().map(|f| f.length).sum(),
+            FileType::SingleFile { length } => *length,
+        }
+    }
 }
 impl FileType {
     fn to_bytes(&self) -> Vec<u8> {

@@ -1,4 +1,7 @@
-use crate::peer::{Peer, PEER_ID};
+use crate::{
+    peer::{Peer, PEER_ID},
+    torrent::Torrent,
+};
 use std::{
     error::Error,
     time::{Duration, Instant},
@@ -7,24 +10,22 @@ use std::{
 use bencode::{Bencode, BencodeDictValues};
 
 #[derive(Debug)]
-pub struct TrackerService {
+pub struct TrackerService<'a> {
     client: reqwest::blocking::Client,
     interval: Duration,
-    tracker_url: String,
     last_updated: Instant,
     port: u16,
-    encoded_info_hash: String,
+    torrent: &'a Torrent,
 }
 
-impl TrackerService {
-    pub fn new(url: &str, port: u16, url_encoded_hash: &str) -> Self {
+impl<'a> TrackerService<'a> {
+    pub fn new(port: u16, torrent: &'a Torrent) -> Self {
         Self {
             client: reqwest::blocking::Client::new(),
             interval: Duration::default(),
-            tracker_url: url.to_string(),
             last_updated: Instant::now(),
             port,
-            encoded_info_hash: url_encoded_hash.to_string(),
+            torrent,
         }
     }
 
@@ -32,24 +33,28 @@ impl TrackerService {
         &mut self,
         uploaded: u64,
         downloaded: u64,
-        left: u64,
     ) -> Result<Vec<Peer>, Box<dyn Error>> {
         let query_params = [
             ("peer_id", PEER_ID),
             ("port", &self.port.to_string()),
             ("uploaded", &uploaded.to_string()),
             ("downloaded", &downloaded.to_string()),
-            ("left", &left.to_string()),
+            ("left", &self.torrent.info.get_file_length().to_string()),
             ("compact", "1"),
         ];
+
+        let tracker_url = self
+            .torrent
+            .announce
+            .as_ref()
+            .expect("Annouce should be present");
+        let encoded_info_hash = self.torrent.info.get_url_encoded_hash();
+
         let request = self
             .client
             // NOTE: Just take the url encoded hash AS IS, don't do anything smart like
             // treating valid characters as not needing to be escaped.
-            .get(format!(
-                "{}?info_hash={}",
-                self.tracker_url, self.encoded_info_hash
-            ))
+            .get(format!("{}?info_hash={}", tracker_url, encoded_info_hash))
             .query(&query_params);
 
         let response = request.send()?.bytes()?;
